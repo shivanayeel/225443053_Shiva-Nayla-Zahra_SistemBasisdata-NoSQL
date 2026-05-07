@@ -1,0 +1,242 @@
+Generate data dummy (minimal 1000 dokumen untuk inspeksi, 50 untuk target_kualitas):
+from pymongo import MongoClient
+from datetime import datetime, timedelta
+import random
+
+# Ganti dengan NIM Anda
+NIM = "225443053"
+client = MongoClient('mongodb://localhost:27017')
+db = client[f'tugas5_{NIM}']
+db.inspeksi.drop()
+db.target_kualitas.drop()
+
+mesin_list = [f"M{i:02d}" for i in range(1, 11)]
+batch_ids = [f"B{str(i).zfill(4)}" for i in range(1, 2001)]
+inspektor_list = ["Andi", "Budi", "Citra", "Dian", "Eka"]
+jenis_cacat_options = ["gores", "retak", "bengkok", "warna", "dimensi", "pori"]
+
+# Generate data inspeksi (1500 dokumen)
+docs = []
+start_date = datetime(2026, 4, 1, 6, 0)
+for i in range(1500):
+    batch = random.choice(batch_ids)
+    mesin = random.choice(mesin_list)
+    tanggal = start_date + timedelta(minutes=random.randint(0, 60*24*90))  # 3 bulan
+    shift = 1 if tanggal.hour < 14 else (2 if tanggal.hour < 22 else 3)
+    jumlah = random.randint(100, 500)
+    reject = int(jumlah * random.uniform(0, 0.10))  # 0-10% cacat
+    jenis = random.sample(jenis_cacat_options, k=random.randint(1, 3))
+    doc = {
+        "batch_id": batch,
+        "mesin": mesin,
+        "tanggal": tanggal,
+        "shift": shift,
+        "inspektor": random.choice(inspektor_list),
+        "jumlah_diperiksa": jumlah,
+        "cacat_ditemukan": reject,
+        "jenis_cacat": jenis
+    }
+    docs.append(doc)
+    if len(docs) >= 500:
+        db.inspeksi.insert_many(docs)
+        docs.clear()
+if docs:
+    db.inspeksi.insert_many(docs)
+
+print("Data inspeksi selesai. Total:", db.inspeksi.count_documents({}))
+
+# Generate target kualitas (setiap batch punya target cacat maksimal 5% dari rata-rata ukuran batch)
+targets = []
+for i in range(1, 2001):
+    batch = f"B{str(i).zfill(4)}"
+    # target cacat acak 1-15
+    target_cacat = random.randint(1, 15)
+    targets.append({"batch_id": batch, "target_maks_cacat": target_cacat})
+    if len(targets) >= 500:
+        db.target_kualitas.insert_many(targets)
+        targets.clear()
+if targets:
+    db.target_kualitas.insert_many(targets)
+
+print("Data target kualitas selesai. Total:", 
+db.target_kualitas.count_documents({}))
+
+Memastikan data siap:
+use tugas5_225443053
+
+db.inspeksi.countDocuments()
+
+db.target_kualitas.countDocuments() 
+
+db.inspeksi.findOne()
+
+db.target_kualitas.findOne()
+
+Indeks untuk mempercepat agregasi:
+db.inspeksi.createIndex({ batch_id: 1 })
+
+db.inspeksi.createIndex({ mesin: 1, tanggal: 1 })
+
+db.target_kualitas.createIndex({ batch_id: 1 })
+
+Pipeline 1, Persentase cacat per batch:
+  { 
+    $addFields: {
+      persen_cacat: { 
+        $multiply: [ 
+          { $divide: ["$cacat_ditemukan", "$jumlah_diperiksa"] }, 
+          100 
+        ] 
+      }
+    }
+  },
+  { $sort: { persen_cacat: -1 } },
+  { $limit: 10 }
+
+Pipeline 2, Gabung dengan Target dan Tentukan Status Batch:
+db.inspeksi.aggregate([
+  {
+    $lookup: {
+      from: "target_kualitas",
+      localField: "batch_id",
+      foreignField: "batch_id",
+      as: "target_info"
+    }
+  },
+  {
+    $unwind: {
+      path: "$target_info",
+      preserveNullAndEmptyArrays: true
+    }
+  },
+  {
+    $addFields: {
+      persen_cacat: {
+        $cond: {
+          if: { $eq: ["$jumlah_diperiksa", 0] },
+          then: 0,
+          else: {
+            $multiply: [
+              { $divide: ["$cacat_ditemukan", "$jumlah_diperiksa"] },
+              100
+            ]
+          }
+        }
+      },
+      target_maks: "$target_info.target_maks_cacat"
+    }
+  },
+  {
+    $addFields: {
+      status: {
+        $cond: {
+          if: { $gt: ["$persen_cacat", "$target_maks"] },
+          then: "NOT OK",
+          else: "OK"
+        }
+      }
+    }
+  },
+  {
+    $project: {
+      _id: 0,
+      batch_id: 1,
+      mesin: 1,
+      persen_cacat: 1,
+      target_maks: 1,
+      status: 1,
+      selisih: {
+        $subtract: [
+          "$persen_cacat",
+          { $ifNull: ["$target_maks", 0] }
+        ]
+      }
+    }
+  },
+  { $sort: { selisih: -1 } },
+  { $limit: 10 }
+])
+
+Pipeline 3, Jumlah Batch NOT OK per Mesin per Minggu:
+db.inspeksi.aggregate([
+  { $lookup: {
+      from: "target_kualitas",
+      localField: "batch_id",
+      foreignField: "batch_id",
+      as: "target_info"
+  }},
+  { $unwind: "$target_info" },
+  { $addFields: {
+      persen_cacat: { $multiply: [ { $divide: ["$cacat_ditemukan", "$jumlah_diperiksa"] }, 100 ] }
+  }},
+  { $addFields: {
+      status: { $cond: { if: { $gt: ["$persen_cacat", "$target_info.target_maks_cacat"] }, then: "NOT OK", else: "OK" } }
+  }},
+  { $match: { status: "NOT OK" } },
+  { $group: {
+      _id: {
+        mesin: "$mesin",
+        minggu: { $week: "$tanggal" },
+        tahun: { $year: "$tanggal" }
+      },
+      jumlah_NOT_OK: { $sum: 1 }
+  }},
+  { $sort: { "_id.tahun": 1, "_id.minggu": 1, "_id.mesin": 1 } }
+])
+
+Pipeline 4, Top 3 Mesin dengan Jumlah NOT OK Terbanyak (dalam satu bulan tertentu):
+db.inspeksi.aggregate([
+  { $match: {
+      tanggal: { $gte: ISODate("2026-05-01"), $lt: ISODate("2026-06-01") }
+  }},
+  { $lookup: {
+      from: "target_kualitas",
+      localField: "batch_id",
+      foreignField: "batch_id",
+      as: "target_info"
+  }},
+  { $unwind: "$target_info" },
+  { $addFields: {
+      persen_cacat: { $multiply: [ { $divide: ["$cacat_ditemukan", "$jumlah_diperiksa"] }, 100 ] }
+  }},
+  { $addFields: {
+      status: { $cond: { if: { $gt: ["$persen_cacat", "$target_info.target_maks_cacat"] }, then: "NOT OK", else: "OK" } }
+  }},
+  { $match: { status: "NOT OK" } },
+  { $group: {
+      _id: "$mesin",
+      total_NOT_OK: { $sum: 1 }
+  }},
+  { $sort: { total_NOT_OK: -1 } },
+  { $limit: 3 }
+])
+
+Pipeline 5 (Bonus/Opsional), Ringkasan Bulanan dengan $facet:
+db.inspeksi.aggregate([
+  { $match: { tanggal: { $gte: ISODate("2026-06-01"), $lt: ISODate("2026-07-01") } } },
+  { $lookup: {
+      from: "target_kualitas",
+      localField: "batch_id",
+      foreignField: "batch_id",
+      as: "target_info"
+  }},
+  { $unwind: "$target_info" },
+  { $addFields: {
+      persen_cacat: { $multiply: [ { $divide: ["$cacat_ditemukan", "$jumlah_diperiksa"] }, 100 ] },
+      status: { $cond: { if: { $gt: [ { $multiply: [ { $divide: ["$cacat_ditemukan", "$jumlah_diperiksa"] }, 100 ] }, "$target_info.target_maks_cacat" ] }, then: "NOT OK", else: "OK" } }
+  }},
+  { $facet: {
+      "total_batch": [
+        { $count: "count" }
+      ],
+      "rata_cacat": [
+        { $group: { _id: null, avg_cacat: { $avg: "$persen_cacat" } } }
+      ],
+      "mesin_terburuk": [
+        { $match: { status: "NOT OK" } },
+        { $group: { _id: "$mesin", jumlah: { $sum: 1 } } },
+        { $sort: { jumlah: -1 } },
+        { $limit: 3 }
+      ]
+  }}
+])

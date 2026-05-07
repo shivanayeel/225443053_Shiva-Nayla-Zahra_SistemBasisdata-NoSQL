@@ -1,0 +1,156 @@
+Gunakan database latihan5, koleksi data_sensor dengan 5000 dokumen (field: sensor_id, nilai, timestamp, category):
+from pymongo import MongoClient
+from datetime import datetime, timedelta
+import random
+
+NIM = "225443053"
+client = MongoClient('mongodb://localhost:27017')
+
+db = client[f'latihan5_{225443053}']
+
+db.data_sensor.drop()
+
+sensor_list = [f"S{i:03d}" for i in range(1, 21)]  # S001 sampai S020
+kategori_list = ["suhu", "tekanan", "kelembaban", "getaran", "arus"]
+
+docs = []
+start_date = datetime(2026, 4, 1, 0, 0)
+
+for i in range(5000):
+    kategori = random.choice(kategori_list)
+    
+    if kategori == "suhu":
+        nilai = round(random.uniform(25.0, 95.0), 2)
+    elif kategori == "kelembaban":
+        nilai = round(random.uniform(40.0, 99.0), 2)
+    else:
+        nilai = round(random.uniform(10.0, 150.0), 2)
+
+    timestamp = start_date + timedelta(minutes=random.randint(0, 60*24*30))
+    
+    doc = {
+        "sensor_id": random.choice(sensor_list),
+        "nilai": nilai,
+        "timestamp": timestamp,
+        "category": kategori
+    }
+    
+    docs.append(doc)
+    
+    if len(docs) >= 500:
+        db.data_sensor.insert_many(docs)
+        docs.clear()
+
+if docs:
+    db.data_sensor.insert_many(docs)
+
+print(f"Database: latihan5_{NIM}")
+print("Data sensor selesai dimasukkan. Total:", 
+db.data_sensor.count_documents({}), "dokumen.")
+
+Menampilkan rata‑rata nilai per sensor_id pada 7 hari terakhir:
+db.data_sensor.aggregate([
+  // Stage 1: Filter data 7 hari terakhir dari sekarang (Mei 2026)
+  { 
+    $match: { 
+      timestamp: { $gte: new Date("2026-04-27T00:00:00Z") } 
+    } 
+  },
+  // Stage 2: Kelompokkan berdasarkan ID dan hitung rata-rata
+  { 
+    $group: { 
+      _id: "$sensor_id", 
+      rata_rata_nilai: { $avg: "$nilai" } 
+    } 
+  },
+  // Stage 3: Urutkan 
+  { $sort: { _id: 1 } }
+])
+
+Menampilkan sensor yang memiliki nilai di atas 90 minimal 3 kali (gunakan $group dengan $push atau $sum kondisional).
+db.data_sensor.aggregate([
+  // Stage 1: Filter hanya dokumen yang nilainya di atas 90
+  { 
+    $match: { 
+      nilai: { $gt: 90 } 
+    } 
+  },
+  // Stage 2: Hitung berapa kali tiap sensor muncul setelah difilter
+  {
+    $group: {
+      _id: "$sensor_id",
+      frekuensi_tinggi: { $sum: 1 }
+    }
+  },
+  // Stage 3: Filter sensor yang muncul minimal 3 kali
+  { 
+    $match: { 
+      frekuensi_tinggi: { $gte: 3 } 
+    } 
+  }
+])
+
+Menambahkan field jam dan menghitung nilai rata‑rata per jam per sensor.
+db.data_sensor.aggregate([
+  {
+    $addFields: {
+      jam: { $hour: "$timestamp" }
+    }
+  },
+  {
+    $group: {
+      _id: {
+        sensor_id: "$sensor_id",
+        jam: "$jam"
+      },
+      rata_rata: { $avg: "$nilai" }
+    }
+  },
+  {
+    $sort: {
+      "_id.sensor_id": 1,
+      "_id.jam": 1
+    }
+  }
+])
+
+Buat koleksi sensor_info lalu join untuk menampilkan nama sensor dalam hasil
+var info = [];
+ for (var i = 1; i <= 20; i++) {
+   var id = "S" + i.toString().padStart(3, '0');
+   info.push({
+     sensor_id: id,
+     nama_sensor: "Device-" + id,
+     lokasi: "Lantai " + (Math.floor(Math.random() * 3) + 1),
+     status: "Aktif"
+   });
+ }
+ db.sensor_info.insertMany(info);
+
+db.data_sensor.aggregate([
+  {
+    $group: {
+      _id: "$sensor_id",
+      rata_rata: { $avg: "$nilai" }
+    }
+  },
+  {
+    $lookup: {
+      from: "sensor_info",
+      localField: "_id",        
+      foreignField: "sensor_id", 
+      as: "detail_sensor"
+    }
+  },
+  
+  { $unwind: "$detail_sensor" },
+  
+  {
+    $project: {
+      _id: 1,
+      rata_rata: 1,
+      lokasi: "$detail_sensor.lokasi",
+    }
+  }
+])
+
