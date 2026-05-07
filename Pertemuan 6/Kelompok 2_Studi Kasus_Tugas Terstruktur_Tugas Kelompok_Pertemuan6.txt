@@ -1,0 +1,758 @@
+STUDI KASUS
+--Mengisi data dummy--
+from pymongo import MongoClient
+from datetime import datetime, timedelta
+import random
+
+client = MongoClient("mongodb://localhost:27017/")
+collection = client["studi_kasus_pertemuan6"]["suhu_mesin"]
+
+collection.delete_many({})
+
+data = []
+waktu_sekarang = datetime.utcnow()
+
+mesin_list = ["Mesin-Potong-A", "Mesin-Potong-B", "Genset-01"]
+
+for i in range(50):
+    waktu_data = waktu_sekarang - timedelta(minutes=50-i)
+    for mesin in mesin_list:
+        suhu_dasar = 80 if mesin == "Genset-01" else 65
+        suhu = suhu_dasar + random.randint(0, 15)
+        
+        data.append({
+            "mesin": mesin,
+            "suhu": suhu,
+            "timestamp": waktu_data
+        })
+
+collection.insert_many(data)
+print(f"Berhasil memasukkan {len(data)} data fiktif ke koleksi suhu_mesin.")
+
+--Script untuk mencari hasil--
+import pandas as pd
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+from datetime import datetime, timedelta
+
+def run_dashboard():
+    try:
+        client = MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=2000)
+        client.admin.command('ping') 
+        db = client["studi_kasus_pertemuan6"]
+        collection = db["suhu_mesin"]
+    except (ConnectionFailure, ServerSelectionTimeoutError):
+        print("Sistem sedang offline: Gagal terhubung ke database MongoDB.")
+        return
+
+    satu_jam_lalu = datetime.utcnow() - timedelta(hours=1)
+    
+    pipeline_terkini = [
+        {"$match": {"timestamp": {"$gte": satu_jam_lalu}}},
+        {"$sort": {"timestamp": -1}}, 
+        {"$group": {
+            "_id": "$mesin", 
+            "suhu_terkini": {"$first": "$suhu"}, 
+            "waktu_terkini": {"$first": "$timestamp"}
+        }},
+        {"$sort": {"_id": 1}}
+    ]
+    data_terkini = list(collection.aggregate(pipeline_terkini))
+    
+    pipeline_rata_rata = [
+        {"$match": {"timestamp": {"$gte": satu_jam_lalu}}},
+        {"$group": {"_id": "$mesin", "rata_rata_suhu": {"$avg": "$suhu"}}},
+        {"$sort": {"_id": 1}}
+    ]
+    data_rata_rata = list(collection.aggregate(pipeline_rata_rata))
+    
+    pipeline_alarm = [
+        {"$match": {"timestamp": {"$gte": satu_jam_lalu}, "suhu": {"$gt": 90}}},
+        {"$group": {"_id": "$mesin", "suhu_maksimum": {"$max": "$suhu"}}},
+        {"$sort": {"_id": 1}}
+    ]
+    data_alarm_maks = list(collection.aggregate(pipeline_alarm))
+
+    log_alarms = list(collection.find(
+        {"timestamp": {"$gte": satu_jam_lalu}, "suhu": {"$gt": 90}}
+    ).sort("timestamp", 1))
+
+    if log_alarms:
+        with open("alarm.log", "a") as f:
+            for alarm in log_alarms:
+                waktu_str = alarm["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+                f.write(f"[{waktu_str}] ALARM - Mesin: {alarm['mesin']} | Suhu: {alarm['suhu']}°C\n")
+
+    print("\n" + "="*60)
+    print(" DASHBOARD MONITORING SUHU MESIN (1 Jam Terakhir)")
+    print("="*60 + "\n")
+
+    print("=== 1. SUHU TERKINI PER MESIN ===")
+    if data_terkini:
+        df_terkini = pd.DataFrame(data_terkini)
+        df_terkini.rename(columns={"_id": "Mesin", "suhu_terkini": "Suhu Terkini (°C)", "waktu_terkini": "Waktu Update (UTC)"}, inplace=True)
+        print(df_terkini.to_string(index=False))
+    else:
+        print("- Tidak ada data suhu dalam 1 jam terakhir.")
+
+    print("\n=== 2. RATA-RATA SUHU PER MESIN ===")
+    if data_rata_rata:
+        df_rata_rata = pd.DataFrame(data_rata_rata)
+        df_rata_rata.rename(columns={"_id": "Mesin", "rata_rata_suhu": "Rata-rata Suhu (°C)"}, inplace=True)
+        df_rata_rata["Rata-rata Suhu (°C)"] = df_rata_rata["Rata-rata Suhu (°C)"].round(2)
+        print(df_rata_rata.to_string(index=False))
+    else:
+        print("- Tidak ada data suhu dalam 1 jam terakhir.")
+
+    print("\n=== 3. STATUS ALARM (Suhu > 90°C) ===")
+    if data_alarm_maks:
+        df_alarm = pd.DataFrame(data_alarm_maks)
+        df_alarm.rename(columns={"_id": "Mesin", "suhu_maksimum": "Suhu Maksimum (°C)"}, inplace=True)
+        print("[!] PERINGATAN! Mesin berikut telah melebihi batas batas aman:")
+        print(df_alarm.to_string(index=False))
+        print("\n*(Catatan detail seluruh kejadian alarm telah disimpan ke alarm.log)*")
+    else:
+        print("[✓] Aman. Tidak ada mesin yang melebihi batas 90°C.")
+    print("\n" + "="*60 + "\n")
+
+if __name__ == "__main__":
+    run_dashboard()
+
+
+TUGAS TERSTRUKTUR
+--Program aplikasi input data produksi dan laporan--
+import os
+import logging
+import pandas as pd
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure, PyMongoError
+from dotenv import load_dotenv
+from datetime import datetime
+import calendar
+
+logging.basicConfig(
+    filename='app.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+load_dotenv()
+MONGO_URI = os.getenv("MONGO_URI")
+DB_NAME = os.getenv("DB_NAME")
+
+try:
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    client.admin.command('ping') # Test koneksi
+    db = client[DB_NAME]
+    col = db["produksi"]
+    logging.info("Berhasil terhubung ke database MongoDB.")
+except ConnectionFailure:
+    logging.error("Gagal terhubung ke MongoDB. Pastikan server berjalan.")
+    print("Error: Tidak dapat terhubung ke database. Cek app.log untuk detail.")
+    exit(1)
+
+
+def input_data():
+    print("\n--- 1. Input Data Produksi ---")
+    try:
+        batch = input("Masukkan Batch: ")
+        mesin = input("Masukkan Nama Mesin: ")
+        jumlah = int(input("Masukkan Jumlah Produksi: "))
+        reject = int(input("Masukkan Jumlah Reject: "))
+        tanggal_str = input("Masukkan Tanggal (YYYY-MM-DD): ")
+        
+        tanggal = datetime.strptime(tanggal_str, "%Y-%m-%d")
+        
+        data = {
+            "batch": batch,
+            "mesin": mesin,
+            "jumlah": jumlah,
+            "reject": reject,
+            "tanggal": tanggal
+        }
+        
+        col.insert_one(data)
+        print("[SUKSES] Data berhasil disimpan.")
+        logging.info(f"Data batch {batch} untuk mesin {mesin} berhasil diinsert.")
+        
+    except ValueError as e:
+        print("[ERROR] Format input salah. Pastikan jumlah/reject berupa angka dan tanggal berformat YYYY-MM-DD.")
+        logging.error(f"Error input data: {e}")
+    except PyMongoError as e:
+        print("[ERROR] Terjadi kesalahan pada database.")
+        logging.error(f"Database error saat insert: {e}")
+
+def tampil_data_mesin():
+    print("\n--- 2. Tampilkan Data per Mesin ---")
+    mesin_input = input("Masukkan Nama Mesin: ")
+    
+    try:
+        data = list(col.find({"mesin": mesin_input}, {"_id": 0}))
+        
+        if not data:
+            print(f"Tidak ada data untuk mesin: {mesin_input}")
+            logging.info(f"Pencarian data mesin {mesin_input} tidak menemukan hasil.")
+            return
+
+        df = pd.DataFrame(data)
+        print("\nData Produksi:")
+        print(df.to_string(index=False))
+        logging.info(f"Berhasil menampilkan {len(data)} data untuk mesin {mesin_input}.")
+        
+    except PyMongoError as e:
+        print("[ERROR] Terjadi kesalahan saat mengambil data.")
+        logging.error(f"Database error saat query mesin: {e}")
+
+def hitung_reject_rate():
+    print("\n--- 3. Batch dengan Reject Rate > 5% ---")
+    
+    pipeline = [
+        {
+            "$addFields": {
+                "reject_rate": {
+                    "$cond": [
+                        {"$eq": ["$jumlah", 0]}, 0, # Hindari division by zero
+                        {"$multiply": [{"$divide": ["$reject", "$jumlah"]}, 100]}
+                    ]
+                }
+            }
+        },
+        {
+            "$match": {"reject_rate": {"$gt": 5}}
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "batch": 1,
+                "mesin": 1,
+                "jumlah": 1,
+                "reject": 1,
+                "reject_rate": {"$round": ["$reject_rate", 2]}
+            }
+        }
+    ]
+    
+    try:
+        hasil = list(col.aggregate(pipeline))
+        
+        if not hasil:
+            print("Tidak ada batch dengan reject rate di atas 5%.")
+            logging.info("Agregasi reject rate dijalankan, tidak ada hasil > 5%.")
+            return
+            
+        df = pd.DataFrame(hasil)
+        df.rename(columns={"reject_rate": "Reject Rate (%)"}, inplace=True)
+        print("\nData Batch Bermasalah:")
+        print(df.to_string(index=False))
+        logging.info(f"Menampilkan {len(hasil)} data batch dengan reject rate tinggi.")
+        
+    except PyMongoError as e:
+        print("[ERROR] Terjadi kesalahan saat menghitung reject rate.")
+        logging.error(f"Database error saat agregasi reject rate: {e}")
+
+def ekspor_laporan():
+    print("\n--- 4. Ekspor Laporan Bulanan ---")
+    periode = input("Masukkan Bulan dan Tahun (MM-YYYY): ")
+    
+    try:
+        bulan, tahun = map(int, periode.split("-"))
+        
+        tanggal_mulai = datetime(tahun, bulan, 1)
+        hari_terakhir = calendar.monthrange(tahun, bulan)[1]
+        tanggal_selesai = datetime(tahun, bulan, hari_terakhir, 23, 59, 59)
+        
+        pipeline = [
+            {
+                "$match": {
+                    "tanggal": {"$gte": tanggal_mulai, "$lte": tanggal_selesai}
+                }
+            },
+            {
+                "$group": {
+                    "_id": "$mesin",
+                    "total_produksi": {"$sum": "$jumlah"},
+                    "total_reject": {"$sum": "$reject"}
+                }
+            },
+            {"$sort": {"_id": 1}}
+        ]
+        
+        hasil = list(col.aggregate(pipeline))
+        
+        if not hasil:
+            print(f"Tidak ada data produksi pada bulan {periode}.")
+            logging.info(f"Ekspor laporan {periode} dibatalkan: data kosong.")
+            return
+            
+        df = pd.DataFrame(hasil)
+        df.rename(columns={"_id": "Mesin", "total_produksi": "Total Produksi", "total_reject": "Total Reject"}, inplace=True)
+        
+        nama_file = f"laporan_{periode}.csv"
+        df.to_csv(nama_file, index=False)
+        print(f"[SUKSES] Laporan berhasil diekspor ke file: {nama_file}")
+        logging.info(f"Berhasil mengekspor laporan bulanan ke {nama_file}.")
+        
+    except ValueError:
+        print("[ERROR] Format bulan-tahun salah. Harap gunakan MM-YYYY (contoh: 10-2023).")
+        logging.error("Error input format periode laporan.")
+    except PyMongoError as e:
+        print("[ERROR] Terjadi kesalahan saat memproses laporan.")
+        logging.error(f"Database error saat ekspor laporan: {e}")
+
+
+def main():
+    while True:
+        print("\n===============================")
+        print(" SISTEM MANAJEMEN PRODUKSI")
+        print("===============================")
+        print("1. Input data produksi baru")
+        print("2. Tampilkan data produksi per mesin")
+        print("3. Hitung batch dengan Reject Rate > 5%")
+        print("4. Ekspor laporan bulanan (CSV)")
+        print("5. Keluar")
+        
+        pilihan = input("Pilih menu (1-5): ")
+        
+        if pilihan == '1':
+            input_data()
+        elif pilihan == '2':
+            tampil_data_mesin()
+        elif pilihan == '3':
+            hitung_reject_rate()
+        elif pilihan == '4':
+            ekspor_laporan()
+        elif pilihan == '5':
+            print("Keluar dari aplikasi. Sampai jumpa!")
+            logging.info("Aplikasi ditutup oleh pengguna.")
+            break
+        else:
+            print("[WARNING] Pilihan tidak valid.")
+
+if __name__ == "__main__":
+    main()
+
+Tugas Kelompok
+--Script mqtt publisher--
+import paho.mqtt.client as mqtt
+import time
+import json
+import random
+from datetime import datetime, timezone
+
+BROKER = "broker.emqx.io" 
+PORT = 1883
+TOPIC = "pabrik/mesin/kesehatan"
+
+daftar_sensor = [
+    {"id": "Robot-Arm-A1", "lokasi": "Jalur Perakitan 1"},
+    {"id": "Robot-Arm-A2", "lokasi": "Jalur Perakitan 1"},
+    {"id": "CNC-Machine-B1", "lokasi": "Sektor Pemotongan"},
+    {"id": "CNC-Machine-B2", "lokasi": "Sektor Pemotongan"},
+    {"id": "Conveyor-Belt-C1", "lokasi": "Jalur Distribusi"},
+    {"id": "Conveyor-Belt-C2", "lokasi": "Jalur Distribusi"},
+    {"id": "Hydraulic-Press-D1", "lokasi": "Sektor Pencetakan"},
+    {"id": "Hydraulic-Press-D2", "lokasi": "Sektor Pencetakan"},
+    {"id": "Packaging-Unit-E1", "lokasi": "Sektor Pengemasan"},
+    {"id": "Packaging-Unit-E2", "lokasi": "Sektor Pengemasan"}
+]
+
+def setup_mqtt():
+    """Fungsi untuk inisialisasi koneksi MQTT"""
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, "Publisher_Mesin_Kelompok6")
+    client.connect(BROKER, PORT)
+    return client
+
+def generate_data(sensor):
+    """Fungsi untuk membuat data sensor tiruan (simulasi)"""
+    vibration = round(random.uniform(2.0, 8.0), 2)
+    temp = round(random.uniform(40.0, 70.0), 2)
+    
+    if random.random() < 0.05:
+        jenis_anomali = random.choice(["getaran", "suhu", "keduanya"])
+        
+        if jenis_anomali in ["getaran", "keduanya"]:
+            vibration = round(random.uniform(15.1, 25.0), 2) # Bahaya: Getaran > 15
+            
+        if jenis_anomali in ["suhu", "keduanya"]:
+            temp = round(random.uniform(90.1, 115.0), 2) # Bahaya: Suhu > 90
+
+    payload = {
+        "sensor_id": sensor["id"],
+        "lokasi": sensor["lokasi"],
+        "vibration_z": vibration,
+        "casing_temp": temp,
+        "rpm": random.randint(1400, 1600),
+        "oil_pressure": round(random.uniform(2.0, 5.0), 2),
+        "timestamp": datetime.now(timezone.utc).isoformat() # Format ISO 8601
+    }
+    return payload
+
+def main():
+    print(f"🚀 Memulai simulasi mesin pabrik ke broker {BROKER}...")
+    client = setup_mqtt()
+    client.loop_start()
+
+    try:
+        while True:
+            print("\n" + "="*50)
+            print(f"Waktu Pengiriman: {datetime.now().strftime('%H:%M:%S')}")
+            
+            for sensor in daftar_sensor:
+                data = generate_data(sensor)
+                
+                payload_json = json.dumps(data)
+                
+                client.publish(TOPIC, payload_json)
+                
+                if data["vibration_z"] > 15 or data["casing_temp"] > 90:
+                    status = "⚠️ ANOMALI"
+                else:
+                    status = "✅ Normal"
+                    
+                print(f"[{status}] {sensor['id']} | Suhu: {data['casing_temp']}°C | Getaran: {data['vibration_z']} mm/s")
+                
+                time.sleep(0.1)
+            
+            print("⏳ Menunggu 10 detik untuk siklus berikutnya...")
+            time.sleep(10) 
+                        
+    except KeyboardInterrupt:
+        print("\n🛑 Simulasi publisher dihentikan oleh pengguna.")
+        client.loop_stop()
+        client.disconnect()
+
+if __name__ == "__main__":
+    main()
+
+--Script subscribe--
+import json
+import paho.mqtt.client as mqtt
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure, PyMongoError
+from colorama import init, Fore, Back, Style
+
+init(autoreset=True)
+
+BROKER = "broker.emqx.io"
+PORT = 1883
+TOPIC = "pabrik/mesin/kesehatan"
+MONGO_URI = "mongodb://localhost:27017/"
+
+try:
+    print(Fore.CYAN + "Menghubungkan ke MongoDB...")
+    client_db = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    client_db.admin.command('ping') 
+    
+    db = client_db["kelompok6"]
+    koleksi_data = db["kesehatan_mesin"]
+    koleksi_alert = db["alert_mesin"]
+    print(Fore.GREEN + Style.BRIGHT + "✅ Berhasil terhubung ke database MongoDB!")
+except ConnectionFailure:
+    print(Fore.RED + Back.WHITE + Style.BRIGHT + " ❌ FATAL ERROR: Gagal terhubung ke MongoDB! ")
+    print(Fore.YELLOW + "Pastikan MongoDB Server sudah berjalan di laptop Anda.")
+    exit()
+
+def on_connect(client, userdata, flags, reason_code, properties):
+    if reason_code == 0:
+        print(Fore.GREEN + f"✅ Terhubung ke MQTT Broker ({BROKER})")
+        client.subscribe(TOPIC)
+        print(Fore.CYAN + f"📡 Mendengarkan topik: {TOPIC}...\n")
+    else:
+        print(Fore.RED + f"❌ Gagal terhubung ke broker, kode: {reason_code}")
+
+def on_message(client, userdata, msg):
+    try:
+        payload_str = msg.payload.decode("utf-8")
+        data = json.loads(payload_str)
+        
+        sensor_id = data.get("sensor_id", "Unknown")
+        lokasi = data.get("lokasi", "Unknown")
+        vibration = data.get("vibration_z", 0.0)
+        temp = data.get("casing_temp", 0.0)
+        timestamp = data.get("timestamp", "No Timestamp")
+        
+        koleksi_data.insert_one(data)
+        
+        if vibration > 15.0 or temp > 90.0:
+            dokumen_alert = {
+                "sensor_id": sensor_id,
+                "lokasi": lokasi,
+                "vibration_z": vibration,
+                "casing_temp": temp,
+                "timestamp": timestamp,
+                "pesan": "Peringatan Kritis: Indikasi Keausan/Overheat!"
+            }
+            koleksi_alert.insert_one(dokumen_alert)
+            
+            print(Fore.WHITE + Back.RED + Style.BRIGHT + f" 🚨 BAHAYA! MESIN KRITIS: {sensor_id} ({lokasi}) ")
+            print(Fore.RED + f"    Suhu: {temp}°C (Batas 90) | Getaran: {vibration} mm/s (Batas 15)")
+            print(Fore.YELLOW + f"    [Tercatat di Database Alert pada {timestamp}]\n")
+            
+        else:
+            print(Fore.WHITE + f"✅ Tersimpan: {sensor_id} | Suhu: {temp}°C | Get: {vibration} mm/s")
+
+    except json.JSONDecodeError:
+        print(Fore.YELLOW + "⚠️ ERROR: Menerima data rusak (Bukan format JSON yang valid). Pesan diabaikan.")
+    except PyMongoError as e:
+        print(Fore.MAGENTA + f"💾 ERROR DATABASE: Gagal menyimpan dokumen. {e}")
+    except Exception as e:
+        print(Fore.RED + f"🔥 ERROR TAK TERDUGA: {e}")
+
+def main():
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, "Subscriber_Mesin_Kelompok6")
+    client.on_connect = on_connect
+    client.on_message = on_message
+
+    try:
+        client.connect(BROKER, PORT)
+        client.loop_forever()
+    except KeyboardInterrupt:
+        print("\n🛑 Subscriber dihentikan secara manual.")
+    except Exception as e:
+        print(Fore.RED + f"❌ Terjadi kesalahan pada jaringan: {e}")
+
+if __name__ == "__main__":
+    main()
+
+--Script untuk membuat gambar analisis--
+import pandas as pd
+import matplotlib.pyplot as plt
+from pymongo import MongoClient
+from datetime import datetime, timedelta, timezone
+import os
+
+def ambil_data_mongodb(uri="mongodb://localhost:27017/", db_name="kelompok6", collection_name="kesehatan_mesin", jam_kebelakang=24):
+    """
+    Mengambil data dari MongoDB untuk rentang waktu tertentu.
+    Mengembalikan list of dictionaries.
+    """
+    try:
+        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        db = client[db_name]
+        koleksi = db[collection_name]
+        
+        waktu_batas = datetime.now(timezone.utc) - timedelta(hours=jam_kebelakang)
+        
+        query = {"timestamp": {"$gte": waktu_batas.isoformat()}}
+        
+        data_kotor = list(koleksi.find(query, {"_id": 0}))
+        return data_kotor
+        
+    except Exception as e:
+        print(f"❌ Error mengambil data dari MongoDB: {e}")
+        return []
+
+def proses_agregasi_pandas(data_list):
+    """
+    Mengubah raw data menjadi DataFrame, membersihkan data, dan
+    menghitung rata-rata getaran & suhu per jam untuk setiap lokasi.
+    """
+    if not data_list:
+        return None
+
+    df = pd.DataFrame(data_list)
+    
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    
+    df['jam'] = df['timestamp'].dt.floor('h')
+    
+    df_agregasi = df.groupby(['lokasi', 'jam'])[['vibration_z', 'casing_temp']].mean().reset_index()
+    
+    df_agregasi = df_agregasi.round({'vibration_z': 2, 'casing_temp': 2})
+    
+    return df_agregasi
+
+def buat_dashboard_grafik(df_agregasi, nama_file="dashboard_tren_mesin.png"):
+    """
+    Membuat grafik garis ganda (Suhu dan Getaran) membandingkan antar lokasi.
+    Menyimpan hasil visualisasi ke dalam file PNG.
+    """
+    if df_agregasi is None or df_agregasi.empty:
+        print("⚠️ Data kosong, tidak bisa membuat grafik.")
+        return
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+    fig.suptitle('Dashboard Analisis Mesin (24 Jam Terakhir)', fontsize=16, fontweight='bold')
+
+    daftar_lokasi = df_agregasi['lokasi'].unique()
+
+    for lokasi in daftar_lokasi:
+        data_lokasi = df_agregasi[df_agregasi['lokasi'] == lokasi]
+        
+        ax1.plot(data_lokasi['jam'], data_lokasi['vibration_z'], marker='o', label=lokasi)
+        
+        ax2.plot(data_lokasi['jam'], data_lokasi['casing_temp'], marker='s', label=lokasi)
+
+    ax1.set_title('Rata-rata Getaran Mesin (Vibration Z) per Jam')
+    ax1.set_ylabel('Vibration (mm/s)')
+    ax1.axhline(y=15.0, color='r', linestyle='--', label='Batas Bahaya (15 mm/s)') # Garis batas bahaya
+    ax1.grid(True, linestyle=':', alpha=0.7)
+    ax1.legend()
+
+    ax2.set_title('Rata-rata Suhu Mesin (Casing Temp) per Jam')
+    ax2.set_ylabel('Temperature (°C)')
+    ax2.set_xlabel('Waktu (Jam)')
+    ax2.axhline(y=90.0, color='r', linestyle='--', label='Batas Overheat (90°C)') # Garis batas bahaya
+    ax2.grid(True, linestyle=':', alpha=0.7)
+    ax2.legend()
+
+    plt.tight_layout()
+    
+    plt.savefig(nama_file, dpi=300)
+    print(f"✅ Grafik berhasil disimpan sebagai: {nama_file}")
+
+def ekspor_ke_csv(df_agregasi, nama_file="data_24jam_mesin.csv"):
+    """Menyimpan data agregasi Pandas ke dalam file CSV."""
+    if df_agregasi is None or df_agregasi.empty:
+        print("⚠️ Data kosong, tidak ada yang diekspor ke CSV.")
+        return
+        
+    df_agregasi.to_csv(nama_file, index=False)
+    print(f"✅ Data CSV berhasil diekspor sebagai: {nama_file}")
+
+def main():
+    print("⏳ Memulai proses analisis data historis...")
+    
+    data_mentah = ambil_data_mongodb()
+    print(f"📊 Ditemukan {len(data_mentah)} data mentah dalam 24 jam terakhir.")
+    
+    df_hasil = proses_agregasi_pandas(data_mentah)
+    
+    if df_hasil is not None:
+        print("\nPratinjau Hasil Agregasi Pandas:")
+        print(df_hasil.head())
+        print("-" * 50)
+        
+        buat_dashboard_grafik(df_hasil)
+        
+        ekspor_ke_csv(df_hasil)
+    else:
+        print("❌ Proses dihentikan karena tidak ada data yang valid.")
+
+if __name__ == "__main__":
+    main()
+
+--Script UI--
+import streamlit as st
+import pandas as pd
+from pymongo import MongoClient
+import os
+
+st.set_page_config(
+    page_title="Dashboard Predictive Maintenance",
+    page_icon="🏭",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+@st.cache_resource
+def init_connection():
+    return MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=5000)
+
+try:
+    client = init_connection()
+    db = client["kelompok6"]
+    koleksi_data = db["kesehatan_mesin"]
+    koleksi_alert = db["alert_mesin"]
+except Exception as e:
+    st.error(f"Gagal terhubung ke Database: {e}")
+
+def get_latest_status():
+    """Mengambil dokumen terbaru untuk setiap sensor menggunakan Aggregation Pipeline"""
+    pipeline = [
+        {"$sort": {"timestamp": -1}},
+        {"$group": {
+            "_id": "$sensor_id",
+            "lokasi": {"$first": "$lokasi"},
+            "vibration_z": {"$first": "$vibration_z"},
+            "casing_temp": {"$first": "$casing_temp"},
+            "timestamp": {"$first": "$timestamp"}
+        }}
+    ]
+    return list(koleksi_data.aggregate(pipeline))
+
+def get_alerts():
+    """Mengambil 20 riwayat peringatan terbaru"""
+    return list(koleksi_alert.find({}, {"_id": 0}).sort("timestamp", -1).limit(20))
+
+def cek_status(val, batas_waspada, batas_bahaya):
+    if val > batas_bahaya:
+        return "🚨 Bahaya", "#ff4b4b" 
+    elif val > batas_waspada:
+        return "⚠️ Waspada", "#ffa500" 
+    else:
+        return "✅ Normal", "#00cc66" 
+
+
+st.title("🏭 Dashboard Predictive Maintenance")
+st.markdown("Sistem Pemantauan Kesehatan Lengan Robotik & Mesin CNC (Real-time)")
+
+tab1, tab2, tab3 = st.tabs(["📊 Status Real-Time", "📈 Analisis Historis", "🚨 Log Peringatan Kritis"])
+
+with tab1:
+    col_btn, col_space = st.columns([1, 4])
+    with col_btn:
+        if st.button("🔄 Perbarui Data Sekarang", width='stretch'):
+            st.rerun()
+            
+    st.markdown("### Status Terkini Mesin")
+    data_terbaru = get_latest_status()
+    
+    if not data_terbaru:
+        st.info("Belum ada data yang masuk. Pastikan Publisher dan Subscriber berjalan.")
+    else:
+        cols = st.columns(5)
+        for i, mesin in enumerate(data_terbaru):
+            col = cols[i % 5]
+            
+            stat_getaran, warna_getaran = cek_status(mesin['vibration_z'], 10, 15)
+            stat_suhu, warna_suhu = cek_status(mesin['casing_temp'], 70, 90)
+            
+            with col:
+                st.markdown(f"""
+                <div style="border:1px solid #ddd; border-radius:10px; padding:15px; margin-bottom:15px; background-color:#f9f9f9; color:#000;">
+                    <h5 style="margin-bottom:5px; color:#333;">🤖 {mesin['_id']}</h5>
+                    <p style="font-size:12px; margin-top:0px; color:#666;">📍 {mesin['lokasi']}</p>
+                    <hr style="margin:5px 0px;">
+                    <p style="margin:2px; font-size:14px;"><strong>Getaran:</strong> {mesin['vibration_z']} mm/s <br><span style="color:{warna_getaran};">{stat_getaran}</span></p>
+                    <p style="margin:2px; font-size:14px;"><strong>Suhu:</strong> {mesin['casing_temp']} °C <br><span style="color:{warna_suhu};">{stat_suhu}</span></p>
+                </div>
+                """, unsafe_allow_html=True)
+
+with tab2:
+    st.markdown("### Tren Kinerja Mesin (24 Jam Terakhir)")
+    if os.path.exists("dashboard_tren_mesin.png"):
+        st.image("dashboard_tren_mesin.png", width='stretch')
+    else:
+        st.warning("Grafik belum tersedia. Silakan jalankan 'analisis_mesin.py' terlebih dahulu.")
+        
+    st.markdown("### Ekspor Data")
+    if os.path.exists("data_24jam_mesin.csv"):
+        with open("data_24jam_mesin.csv", "rb") as file:
+            st.download_button(
+                label="📥 Unduh Data CSV (24 Jam)",
+                data=file,
+                file_name="data_24jam_mesin.csv",
+                mime="text/csv"
+            )
+
+with tab3:
+    st.markdown("### Riwayat Anomali dan Kerusakan")
+    alerts = get_alerts()
+    if not alerts:
+        st.success("Bagus! Tidak ada peringatan kritis sejauh ini.")
+    else:
+        df_alerts = pd.DataFrame(alerts)
+        st.dataframe(df_alerts, width='stretch')
+
+
+
+
+
+
+
+
+
+
+
+
